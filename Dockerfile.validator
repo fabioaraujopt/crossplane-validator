@@ -48,10 +48,27 @@ RUN mkdir -p /home/nonroot/.crossplane/cache/crd-sources
 
 # Pre-cache frequently used CRD sources to speed up validation
 # This downloads CRDs at build time so they're available in CI/CD
-RUN crank beta validate --help > /dev/null 2>&1 && \
-    echo "Pre-caching CRDs..." && \
+RUN echo "Pre-caching CRDs..." && \
     mkdir -p /tmp/dummy && \
-    echo 'apiVersion: apiextensions.crossplane.io/v1\nkind: Composition\nmetadata:\n  name: dummy\nspec:\n  compositeTypeRef:\n    apiVersion: example.com/v1\n    kind: Dummy' > /tmp/dummy/composition.yaml && \
+    cat > /tmp/dummy/composition.yaml <<'EOF'
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: dummy
+spec:
+  compositeTypeRef:
+    apiVersion: example.com/v1
+    kind: Dummy
+  mode: Pipeline
+  pipeline:
+    - step: dummy
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources: []
+EOF
     crank beta validate /tmp/dummy /tmp/dummy \
       --crd-sources "github:crossplane/crossplane:main:cluster/crds" \
       --crd-sources "github:crossplane-contrib/provider-upjet-aws:main:package/crds" \
@@ -82,9 +99,10 @@ RUN crank beta validate --help > /dev/null 2>&1 && \
       --crd-sources "github:crossplane-contrib/function-tag-manager:main:package/input" \
       --crd-sources "catalog:https://raw.githubusercontent.com/datreeio/CRDs-catalog/main" \
       --crd-sources "k8s:v1.34.0" \
-      --only-invalid || true && \
-    rm -rf /tmp/dummy && \
-    echo "CRD cache populated!"
+      --only-invalid 2>&1 | grep -E "Fetching|Found|Loading" || true
+    echo "CRD cache populated!" && \
+    ls -la /home/nonroot/.crossplane/cache/crd-sources/ && \
+    rm -rf /tmp/dummy
 
 # Set working directory for validation
 WORKDIR /workspace
