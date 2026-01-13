@@ -1,0 +1,121 @@
+name: Build and Push Validator Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'Dockerfile.validator'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/build-and-push.yaml'
+  workflow_dispatch:  # Allow manual triggers
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ECR_REPOSITORY: crossplane-validator
+  AWS_REGION: us-east-1
+
+jobs:
+  build:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest  # Native amd64 - no QEMU needed!
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::585768152950:role/github-actions
+          role-session-name: crossplane-validator-build
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Get Git info
+        id: git-info
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "branch=$(echo ${GITHUB_REF#refs/heads/} | tr '/' '-')" >> $GITHUB_OUTPUT
+      
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "🔨 Building Docker image on native amd64..."
+          docker build \
+            -f Dockerfile.validator \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.git-info.outputs.sha_short }} \
+            -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.git-info.outputs.branch }} \
+            .
+      
+      - name: Pre-cache CRDs in image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "📦 Pre-caching CRDs (running on native amd64 - no QEMU issues!)..."
+          
+          # Create a new image with pre-cached CRDs
+          docker run --name crd-cache $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            beta validate /workspace /workspace \
+              --prefetch-all-crds \
+              --parallel-fetch 20 \
+              --crd-sources "github:crossplane/crossplane:main:cluster/crds" \
+              --crd-sources "github:crossplane-contrib/provider-upjet-aws:main:package/crds" \
+              --crd-sources "github:crossplane-contrib/provider-upjet-azure:main:package/crds" \
+              --crd-sources "github:crossplane-contrib/provider-helm:main:package/crds" \
+              --crd-sources "github:crossplane-contrib/provider-kubernetes:main:package/crds" \
+              --crd-sources "github:upbound/provider-vault:main:package/crds" \
+              --crd-sources "github:deinstapel/nats-jwt-operator:main:config/crd/bases" \
+              --crd-sources "github:crossplane-contrib/function-patch-and-transform:main:package/input" \
+              --crd-sources "github:crossplane-contrib/function-sequencer:main:package/input" \
+              --crd-sources "github:crossplane-contrib/function-tag-manager:main:package/input" \
+              --crd-sources "k8s:v1.34.0" \
+              --skip-success-results 2>&1 || true
+          
+          # Commit the container with cached CRDs to a new image
+          docker commit crd-cache $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker commit crd-cache $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.git-info.outputs.sha_short }}
+          docker commit crd-cache $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.git-info.outputs.branch }}
+          docker rm crd-cache
+          
+          # Verify cache
+          echo "✅ Verifying CRD cache..."
+          docker run --rm --entrypoint sh $ECR_REGISTRY/$ECR_REPOSITORY:latest -c \
+            "find /home/nonroot/.crossplane/cache/crd-sources/ -name '*.yaml' 2>/dev/null | wc -l | xargs -I{} echo 'CRDs cached: {}'"
+      
+      - name: Push to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "📤 Pushing images to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.git-info.outputs.sha_short }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.git-info.outputs.branch }}
+          echo "✅ Images pushed successfully!"
+      
+      - name: Summary
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "## 🚀 Validator Image Built and Pushed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Images:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$ECR_REGISTRY/$ECR_REPOSITORY:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.git-info.outputs.sha_short }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`$ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.git-info.outputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Features:**" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Built on native amd64 (no QEMU)" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ CRDs pre-cached for fast validation" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Parallel CRD fetching enabled" >> $GITHUB_STEP_SUMMARY
