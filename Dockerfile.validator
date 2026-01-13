@@ -75,11 +75,11 @@ RUN crank beta validate --help > /dev/null 2>&1 && \
       --crd-sources "github:upbound/provider-azure-containerservice:main:package/crds" \
       --crd-sources "github:upbound/provider-azure-storage:main:package/crds" \
       --crd-sources "github:upbound/provider-vault:main:package/crds" \
-      --crd-sources "github:deinstapel/nats-operator:main:crds" \
-      --crd-sources "github:crossplane-contrib/function-patch-and-transform:main" \
-      --crd-sources "github:crossplane-contrib/function-auto-ready:main" \
-      --crd-sources "github:crossplane-contrib/function-sequencer:main" \
-      --crd-sources "github:crossplane-contrib/function-tag-manager:main" \
+      --crd-sources "github:deinstapel/nats-jwt-operator:main:config/crd/bases" \
+      --crd-sources "github:crossplane-contrib/function-patch-and-transform:main:package/input" \
+      --crd-sources "github:crossplane-contrib/function-auto-ready:main:package/input" \
+      --crd-sources "github:crossplane-contrib/function-sequencer:main:package/input" \
+      --crd-sources "github:crossplane-contrib/function-tag-manager:main:package/input" \
       --crd-sources "catalog:https://raw.githubusercontent.com/datreeio/CRDs-catalog/main" \
       --crd-sources "k8s:v1.34.0" \
       --only-invalid || true && \
