@@ -46,61 +46,30 @@ USER nonroot
 # Create cache directory with proper permissions
 RUN mkdir -p /home/nonroot/.crossplane/cache/crd-sources
 
-# Pre-cache frequently used CRD sources to speed up validation
-# This downloads CRDs at build time so they're available in CI/CD
-RUN echo "Pre-caching CRDs..." && \
-    mkdir -p /tmp/dummy && \
-    cat > /tmp/dummy/composition.yaml <<'EOF'
-apiVersion: apiextensions.crossplane.io/v1
-kind: Composition
-metadata:
-  name: dummy
-spec:
-  compositeTypeRef:
-    apiVersion: example.com/v1
-    kind: Dummy
-  mode: Pipeline
-  pipeline:
-    - step: dummy
-      functionRef:
-        name: function-patch-and-transform
-      input:
-        apiVersion: pt.fn.crossplane.io/v1beta1
-        kind: Resources
-        resources: []
-EOF
+# Pre-cache ALL CRDs from frequently used sources to speed up CI/CD validation
+# Uses --prefetch-all-crds to download everything in parallel (20 concurrent connections)
+# Note: catalog sources don't support prefetch-all (they're on-demand only)
+# Note: Additional CRDs will be fetched on-demand at runtime if needed
+RUN echo "=== Pre-caching CRDs from all sources ===" && \
+    mkdir -p /tmp/dummy && touch /tmp/dummy/empty.yaml && \
     crank beta validate /tmp/dummy /tmp/dummy \
+      --prefetch-all-crds \
+      --parallel-fetch 20 \
       --crd-sources "github:crossplane/crossplane:main:cluster/crds" \
       --crd-sources "github:crossplane-contrib/provider-upjet-aws:main:package/crds" \
       --crd-sources "github:crossplane-contrib/provider-upjet-azure:main:package/crds" \
       --crd-sources "github:crossplane-contrib/provider-helm:main:package/crds" \
       --crd-sources "github:crossplane-contrib/provider-kubernetes:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-ec2:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-eks:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-iam:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-s3:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-rds:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-kms:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-lambda:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-sns:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-sqs:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-route53:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-acm:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-elasticache:main:package/crds" \
-      --crd-sources "github:upbound/provider-aws-secretsmanager:main:package/crds" \
-      --crd-sources "github:upbound/provider-azure-network:main:package/crds" \
-      --crd-sources "github:upbound/provider-azure-containerservice:main:package/crds" \
-      --crd-sources "github:upbound/provider-azure-storage:main:package/crds" \
       --crd-sources "github:upbound/provider-vault:main:package/crds" \
       --crd-sources "github:deinstapel/nats-jwt-operator:main:config/crd/bases" \
       --crd-sources "github:crossplane-contrib/function-patch-and-transform:main:package/input" \
-      --crd-sources "github:crossplane-contrib/function-auto-ready:main:package/input" \
       --crd-sources "github:crossplane-contrib/function-sequencer:main:package/input" \
       --crd-sources "github:crossplane-contrib/function-tag-manager:main:package/input" \
-      --crd-sources "catalog:https://raw.githubusercontent.com/datreeio/CRDs-catalog/main" \
       --crd-sources "k8s:v1.34.0" \
-      --only-invalid 2>&1 | grep -E "Fetching|Found|Loading" || true
-    echo "CRD cache populated!" && \
+      --skip-success-results 2>&1 || true && \
+    echo "" && \
+    echo "=== CRD Cache Summary ===" && \
+    find /home/nonroot/.crossplane/cache/crd-sources/ -name "*.yaml" | wc -l | xargs -I{} echo "Total CRDs cached: {}" && \
     ls -la /home/nonroot/.crossplane/cache/crd-sources/ && \
     rm -rf /tmp/dummy
 

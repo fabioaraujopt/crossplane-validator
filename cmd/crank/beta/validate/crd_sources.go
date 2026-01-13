@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -150,9 +151,10 @@ var CoreK8sTypes = map[string]struct {
 
 // CRDSourceFetcher fetches CRDs from various sources.
 type CRDSourceFetcher struct {
-	cacheDir   string
-	httpClient *http.Client
-	writer     io.Writer
+	cacheDir    string
+	httpClient  *http.Client
+	writer      io.Writer
+	parallelism int
 }
 
 // NewCRDSourceFetcher creates a new CRDSourceFetcher.
@@ -162,7 +164,15 @@ func NewCRDSourceFetcher(cacheDir string, w io.Writer) *CRDSourceFetcher {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		writer: w,
+		writer:      w,
+		parallelism: 10, // default
+	}
+}
+
+// SetParallelism sets the number of parallel fetch operations.
+func (f *CRDSourceFetcher) SetParallelism(n int) {
+	if n > 0 {
+		f.parallelism = n
 	}
 }
 
@@ -173,6 +183,327 @@ func (f *CRDSourceFetcher) CleanCache() error {
 		return nil // Nothing to clean
 	}
 	return os.RemoveAll(cacheDir)
+}
+
+// sourceResult holds the result of fetching from a single source.
+type sourceResult struct {
+	source CRDSource
+	crds   []*extv1.CustomResourceDefinition
+	err    error
+}
+
+// PrefetchAllFromSources downloads ALL CRDs from all sources in parallel.
+// This is useful for pre-populating the cache in Docker images.
+// Returns all CRDs found and any errors encountered (non-fatal - continues on error).
+func (f *CRDSourceFetcher) PrefetchAllFromSources(ctx context.Context, sources []CRDSource) ([]*extv1.CustomResourceDefinition, []error) {
+	if _, err := fmt.Fprintf(f.writer, "\n=== Prefetching ALL CRDs from %d sources (parallel=%d) ===\n\n", len(sources), f.parallelism); err != nil {
+		return nil, []error{errors.Wrap(err, "cannot write output")}
+	}
+
+	// Create a channel for results and a semaphore for parallelism
+	results := make(chan sourceResult, len(sources))
+	sem := make(chan struct{}, f.parallelism)
+
+	var wg sync.WaitGroup
+
+	// Launch parallel fetches
+	for _, source := range sources {
+		wg.Add(1)
+		go func(src CRDSource) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			crds, err := f.prefetchAllFromSource(ctx, src)
+			results <- sourceResult{source: src, crds: crds, err: err}
+		}(source)
+	}
+
+	// Wait for all fetches to complete and close results channel
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results
+	var allCRDs []*extv1.CustomResourceDefinition
+	var allErrors []error
+	successCount := 0
+	crdCount := 0
+
+	for result := range results {
+		if result.err != nil {
+			allErrors = append(allErrors, fmt.Errorf("%s: %w", result.source.Location, result.err))
+			if _, err := fmt.Fprintf(f.writer, "    ❌ %s: %v\n", result.source.Location, result.err); err != nil {
+				allErrors = append(allErrors, errors.Wrap(err, "cannot write output"))
+			}
+		} else {
+			allCRDs = append(allCRDs, result.crds...)
+			successCount++
+			crdCount += len(result.crds)
+			if _, err := fmt.Fprintf(f.writer, "    ✅ %s: %d CRDs\n", result.source.Location, len(result.crds)); err != nil {
+				allErrors = append(allErrors, errors.Wrap(err, "cannot write output"))
+			}
+		}
+	}
+
+	if _, err := fmt.Fprintf(f.writer, "\n[✓] Prefetched %d CRDs from %d/%d sources\n", crdCount, successCount, len(sources)); err != nil {
+		allErrors = append(allErrors, errors.Wrap(err, "cannot write output"))
+	}
+
+	return allCRDs, allErrors
+}
+
+// prefetchAllFromSource fetches ALL CRDs from a single source (not just required ones).
+func (f *CRDSourceFetcher) prefetchAllFromSource(ctx context.Context, source CRDSource) ([]*extv1.CustomResourceDefinition, error) {
+	switch source.Type {
+	case CRDSourceTypeGitHub:
+		return f.prefetchAllFromGitHub(ctx, source)
+	case CRDSourceTypeLocal:
+		return f.prefetchAllFromLocal(source)
+	case CRDSourceTypeK8sSchemas:
+		return f.prefetchAllK8sSchemas(ctx, source)
+	default:
+		// For other types (catalog, cluster), we can't enumerate all CRDs
+		return nil, fmt.Errorf("prefetch-all not supported for source type: %s", source.Type)
+	}
+}
+
+// prefetchAllFromGitHub downloads ALL CRDs from a GitHub repository using the GitHub API.
+func (f *CRDSourceFetcher) prefetchAllFromGitHub(ctx context.Context, source CRDSource) ([]*extv1.CustomResourceDefinition, error) {
+	// Check cache first
+	cacheKey := fmt.Sprintf("github-%s-%s", strings.ReplaceAll(source.Location, "/", "-"), source.Branch)
+	cachePath := filepath.Join(f.cacheDir, "crd-sources", cacheKey)
+
+	// If cache exists, load from it
+	if info, err := os.Stat(cachePath); err == nil && info.IsDir() {
+		return f.loadAllFromCache(cachePath)
+	}
+
+	// Use GitHub API to list directory contents
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/contents/%s?ref=%s",
+		source.Location, source.Path, source.Branch)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GitHub API returned HTTP %d for %s", resp.StatusCode, apiURL)
+	}
+
+	var files []struct {
+		Name        string `json:"name"`
+		DownloadURL string `json:"download_url"`
+		Type        string `json:"type"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		return nil, err
+	}
+
+	// Filter YAML files
+	var yamlFiles []struct {
+		Name        string
+		DownloadURL string
+	}
+	for _, file := range files {
+		if file.Type == "file" && (strings.HasSuffix(file.Name, ".yaml") || strings.HasSuffix(file.Name, ".yml")) {
+			yamlFiles = append(yamlFiles, struct {
+				Name        string
+				DownloadURL string
+			}{Name: file.Name, DownloadURL: file.DownloadURL})
+		}
+	}
+
+	// Download CRDs in parallel with error collection
+	type crdResult struct {
+		crd *extv1.CustomResourceDefinition
+		err error
+		url string
+	}
+
+	crdResults := make(chan crdResult, len(yamlFiles))
+	sem := make(chan struct{}, f.parallelism)
+	var wg sync.WaitGroup
+
+	for _, file := range yamlFiles {
+		wg.Add(1)
+		go func(name, downloadURL string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			crd, err := f.fetchCRDFromURL(ctx, downloadURL)
+			if err != nil {
+				crdResults <- crdResult{err: err, url: downloadURL}
+				return
+			}
+
+			// Only save valid CRDs
+			if crd != nil && crd.Kind == "CustomResourceDefinition" {
+				f.saveCRDToCache(cachePath, name, crd)
+				crdResults <- crdResult{crd: crd}
+			} else {
+				crdResults <- crdResult{} // Not a CRD, skip silently
+			}
+		}(file.Name, file.DownloadURL)
+	}
+
+	go func() {
+		wg.Wait()
+		close(crdResults)
+	}()
+
+	// Collect results
+	var crds []*extv1.CustomResourceDefinition
+	var fetchErrors []string
+	for result := range crdResults {
+		if result.err != nil {
+			fetchErrors = append(fetchErrors, fmt.Sprintf("%s: %v", result.url, result.err))
+		} else if result.crd != nil {
+			crds = append(crds, result.crd)
+		}
+	}
+
+	// Report errors but don't fail (we still got some CRDs)
+	if len(fetchErrors) > 0 && len(fetchErrors) < len(yamlFiles) {
+		// Only warn if some files failed, not all
+		// If all failed, the caller will see 0 CRDs
+	}
+
+	return crds, nil
+}
+
+// prefetchAllFromLocal loads ALL CRDs from a local directory.
+func (f *CRDSourceFetcher) prefetchAllFromLocal(source CRDSource) ([]*extv1.CustomResourceDefinition, error) {
+	var crds []*extv1.CustomResourceDefinition
+
+	err := filepath.Walk(source.Location, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".yaml") && !strings.HasSuffix(path, ".yml") {
+			return nil
+		}
+
+		data, err := os.ReadFile(filepath.Clean(path))
+		if err != nil {
+			return nil // Skip unreadable files
+		}
+
+		var crd extv1.CustomResourceDefinition
+		if err := yaml.Unmarshal(data, &crd); err != nil {
+			return nil // Skip non-CRD files
+		}
+
+		if crd.Kind == "CustomResourceDefinition" {
+			crds = append(crds, &crd)
+		}
+
+		return nil
+	})
+
+	return crds, err
+}
+
+// prefetchAllK8sSchemas downloads ALL known K8s core type schemas.
+func (f *CRDSourceFetcher) prefetchAllK8sSchemas(ctx context.Context, source CRDSource) ([]*extv1.CustomResourceDefinition, error) {
+	k8sVersion := source.Location
+	if k8sVersion == "" {
+		k8sVersion = "v1.29.0"
+	}
+
+	// Download all known K8s types in parallel
+	type schemaResult struct {
+		crd *extv1.CustomResourceDefinition
+		err error
+		gvk string
+	}
+
+	results := make(chan schemaResult, len(CoreK8sTypes))
+	sem := make(chan struct{}, f.parallelism)
+	var wg sync.WaitGroup
+
+	for gvk, coreType := range CoreK8sTypes {
+		wg.Add(1)
+		go func(gvkStr string, ct struct {
+			Group   string
+			Version string
+			Kind    string
+		}) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			kindLower := strings.ToLower(ct.Kind)
+			url := fmt.Sprintf("https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/%s/%s.json",
+				k8sVersion, kindLower)
+
+			crd, err := f.fetchJSONSchemaAsCRD(ctx, url, ct.Group, ct.Version, ct.Kind)
+			results <- schemaResult{crd: crd, err: err, gvk: gvkStr}
+		}(gvk, coreType)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var crds []*extv1.CustomResourceDefinition
+	for result := range results {
+		if result.err == nil && result.crd != nil {
+			crds = append(crds, result.crd)
+		}
+		// Silently skip errors for individual schemas
+	}
+
+	return crds, nil
+}
+
+// loadAllFromCache loads ALL CRDs from a cache directory (for prefetch).
+func (f *CRDSourceFetcher) loadAllFromCache(cachePath string) ([]*extv1.CustomResourceDefinition, error) {
+	var crds []*extv1.CustomResourceDefinition
+
+	err := filepath.Walk(cachePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		if !strings.HasSuffix(path, ".yaml") {
+			return nil
+		}
+
+		data, err := os.ReadFile(filepath.Clean(path))
+		if err != nil {
+			return nil
+		}
+
+		var crd extv1.CustomResourceDefinition
+		if err := yaml.Unmarshal(data, &crd); err != nil {
+			return nil
+		}
+
+		if crd.Kind == "CustomResourceDefinition" {
+			crds = append(crds, &crd)
+		}
+
+		return nil
+	})
+
+	return crds, err
 }
 
 // FetchFromSources fetches CRDs from multiple sources for the required GVKs.

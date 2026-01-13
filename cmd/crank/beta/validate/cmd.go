@@ -26,6 +26,7 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/spf13/afero"
+	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
 
@@ -70,6 +71,8 @@ type Cmd struct {
 	CRDSources       []string `help:"CRD sources for schema validation. Formats: github:org/repo:branch:path, catalog:https://url, local:/path/to/crds, cluster, or GitHub URLs (https://github.com/owner/repo#branch:path)." sep:","`
 	FailOnMissingCRD bool     `default:"false" help:"Fail validation if required CRDs cannot be found in any source."`
 	CleanCRDCache    bool     `default:"false" help:"Clean the CRD source cache before fetching. Forces re-download of all CRDs."`
+	PrefetchAllCRDs  bool     `name:"prefetch-all-crds" default:"false" help:"Download ALL CRDs from each source, not just those needed for validation. Useful for pre-caching in Docker images."`
+	ParallelFetch    int      `name:"parallel-fetch" default:"10"    help:"Number of parallel CRD fetch operations. Higher values speed up downloads but use more connections."`
 
 	fs afero.Fs
 }
@@ -269,13 +272,9 @@ func (c *Cmd) Run(k *kong.Context, _ logging.Logger) error {
 			return errors.Wrapf(err, "cannot parse CRD sources")
 		}
 
-		// Discover all GVKs and filter out user XRDs (they come from XRD files)
-		allGVKs := discoverRequiredGVKs(extensions)
-		userXRDGroups := getUserXRDGroups(extensions)
-		requiredGVKs := filterExternalGVKs(allGVKs, userXRDGroups)
-
-		// Create fetcher
+		// Create fetcher with parallel option
 		sourceFetcher := NewCRDSourceFetcher(c.CacheDir, k.Stdout)
+		sourceFetcher.SetParallelism(c.ParallelFetch)
 
 		// Clean cache if requested
 		if c.CleanCRDCache {
@@ -287,24 +286,49 @@ func (c *Cmd) Run(k *kong.Context, _ logging.Logger) error {
 			}
 		}
 
-		// Fetch CRDs
-		sourceCRDs, err := sourceFetcher.FetchFromSources(context.Background(), sources, requiredGVKs)
-		if err != nil {
-			return errors.Wrapf(err, "cannot fetch CRDs from sources")
-		}
+		var sourceCRDs []*extv1.CustomResourceDefinition
+		var fetchErrs []error
 
-		// Check for missing CRDs
-		if c.FailOnMissingCRD {
-			foundGVKs := make(map[string]bool)
-			for _, crd := range sourceCRDs {
-				for _, v := range crd.Spec.Versions {
-					gvk := fmt.Sprintf("%s/%s, Kind=%s", crd.Spec.Group, v.Name, crd.Spec.Names.Kind)
-					foundGVKs[gvk] = true
+		if c.PrefetchAllCRDs {
+			// Prefetch ALL CRDs from each source (for Docker image caching)
+			sourceCRDs, fetchErrs = sourceFetcher.PrefetchAllFromSources(context.Background(), sources)
+		} else {
+			// Discover all GVKs and filter out user XRDs (they come from XRD files)
+			allGVKs := discoverRequiredGVKs(extensions)
+			userXRDGroups := getUserXRDGroups(extensions)
+			requiredGVKs := filterExternalGVKs(allGVKs, userXRDGroups)
+
+			// Fetch only required CRDs
+			sourceCRDs, err = sourceFetcher.FetchFromSources(context.Background(), sources, requiredGVKs)
+			if err != nil {
+				return errors.Wrapf(err, "cannot fetch CRDs from sources")
+			}
+
+			// Check for missing CRDs
+			if c.FailOnMissingCRD {
+				foundGVKs := make(map[string]bool)
+				for _, crd := range sourceCRDs {
+					for _, v := range crd.Spec.Versions {
+						gvk := fmt.Sprintf("%s/%s, Kind=%s", crd.Spec.Group, v.Name, crd.Spec.Names.Kind)
+						foundGVKs[gvk] = true
+					}
+				}
+				missing := sourceFetcher.GetMissingGVKs(requiredGVKs, foundGVKs)
+				if len(missing) > 0 {
+					return fmt.Errorf("failed to find %d required CRDs in any source", len(missing))
 				}
 			}
-			missing := sourceFetcher.GetMissingGVKs(requiredGVKs, foundGVKs)
-			if len(missing) > 0 {
-				return fmt.Errorf("failed to find %d required CRDs in any source", len(missing))
+		}
+
+		// Report any errors from prefetch (but don't fail - we still got some CRDs)
+		if len(fetchErrs) > 0 {
+			if _, err := fmt.Fprintf(k.Stdout, "\n[!] %d sources had errors during fetch:\n", len(fetchErrs)); err != nil {
+				return errors.Wrapf(err, "cannot write output")
+			}
+			for _, fetchErr := range fetchErrs {
+				if _, err := fmt.Fprintf(k.Stdout, "    ⚠️  %v\n", fetchErr); err != nil {
+					return errors.Wrapf(err, "cannot write output")
+				}
 			}
 		}
 
