@@ -507,50 +507,73 @@ func (f *CRDSourceFetcher) loadAllFromCache(cachePath string) ([]*extv1.CustomRe
 }
 
 // FetchFromSources fetches CRDs from multiple sources for the required GVKs.
+// Uses parallel fetching to speed up the process.
 func (f *CRDSourceFetcher) FetchFromSources(ctx context.Context, sources []CRDSource, requiredGVKs map[string]bool) ([]*extv1.CustomResourceDefinition, error) {
-	var allCRDs []*extv1.CustomResourceDefinition
-	foundGVKs := make(map[string]bool)
-
 	if _, err := fmt.Fprintf(f.writer, "\n=== CRD Source Discovery ===\n"); err != nil {
 		return nil, errors.Wrap(err, "cannot write output")
 	}
-	if _, err := fmt.Fprintf(f.writer, "Looking for %d required CRDs from %d sources...\n\n", len(requiredGVKs), len(sources)); err != nil {
+	if _, err := fmt.Fprintf(f.writer, "Looking for %d required CRDs from %d sources (parallel=%d)...\n\n", len(requiredGVKs), len(sources), f.parallelism); err != nil {
 		return nil, errors.Wrap(err, "cannot write output")
 	}
 
-	for i, source := range sources {
-		remaining := 0
-		for gvk := range requiredGVKs {
-			if !foundGVKs[gvk] {
-				remaining++
-			}
-		}
+	// Use parallel fetching for all sources
+	type fetchResult struct {
+		source CRDSource
+		crds   []*extv1.CustomResourceDefinition
+		err    error
+	}
 
-		if remaining == 0 {
-			if _, err := fmt.Fprintf(f.writer, "[%d/%d] Skipping %s (all CRDs found)\n", i+1, len(sources), source.Location); err != nil {
+	results := make(chan fetchResult, len(sources))
+	sem := make(chan struct{}, f.parallelism)
+	var wg sync.WaitGroup
+
+	// Create a copy of requiredGVKs for thread-safe checking
+	// Each goroutine will work with its own foundGVKs map
+	for _, source := range sources {
+		wg.Add(1)
+		go func(src CRDSource) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Each goroutine gets its own foundGVKs map for thread safety
+			localFoundGVKs := make(map[string]bool)
+			crds, err := f.fetchFromSource(ctx, src, requiredGVKs, localFoundGVKs)
+			results <- fetchResult{source: src, crds: crds, err: err}
+		}(source)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results and merge found GVKs
+	var allCRDs []*extv1.CustomResourceDefinition
+	foundGVKs := make(map[string]bool)
+	var fetchErrors []string
+
+	for result := range results {
+		if result.err != nil {
+			fetchErrors = append(fetchErrors, fmt.Sprintf("%s: %v", result.source.Location, result.err))
+			if _, err := fmt.Fprintf(f.writer, "    ⚠️  %s: %v\n", result.source.Location, result.err); err != nil {
 				return nil, errors.Wrap(err, "cannot write output")
 			}
-			continue
-		}
-
-		if _, err := fmt.Fprintf(f.writer, "[%d/%d] Checking %s (%d CRDs remaining)...\n", i+1, len(sources), source.Location, remaining); err != nil {
-			return nil, errors.Wrap(err, "cannot write output")
-		}
-
-		crds, err := f.fetchFromSource(ctx, source, requiredGVKs, foundGVKs)
-		if err != nil {
-			if _, wErr := fmt.Fprintf(f.writer, "    ⚠️  Failed: %v\n", err); wErr != nil {
-				return nil, errors.Wrap(wErr, "cannot write warning")
+		} else if len(result.crds) > 0 {
+			// Deduplicate CRDs based on GVK
+			for _, crd := range result.crds {
+				for _, version := range crd.Spec.Versions {
+					gvk := fmt.Sprintf("%s/%s, Kind=%s", crd.Spec.Group, version.Name, crd.Spec.Names.Kind)
+					if !foundGVKs[gvk] {
+						foundGVKs[gvk] = true
+						allCRDs = append(allCRDs, crd)
+					}
+				}
 			}
-			continue
-		}
-
-		if len(crds) > 0 {
-			if _, err := fmt.Fprintf(f.writer, "    ✅ Found %d CRDs\n", len(crds)); err != nil {
+			if _, err := fmt.Fprintf(f.writer, "    ✅ %s: %d CRDs\n", result.source.Location, len(result.crds)); err != nil {
 				return nil, errors.Wrap(err, "cannot write output")
 			}
 		}
-		allCRDs = append(allCRDs, crds...)
 	}
 
 	// Report missing GVKs

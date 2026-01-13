@@ -46,32 +46,12 @@ USER nonroot
 # Create cache directory with proper permissions
 RUN mkdir -p /home/nonroot/.crossplane/cache/crd-sources
 
-# Pre-cache ALL CRDs from frequently used sources to speed up CI/CD validation
-# Uses --prefetch-all-crds to download everything in parallel (20 concurrent connections)
-# Note: catalog sources don't support prefetch-all (they're on-demand only)
-# Note: Additional CRDs will be fetched on-demand at runtime if needed
-RUN echo "=== Pre-caching CRDs from all sources ===" && \
-    mkdir -p /tmp/dummy && touch /tmp/dummy/empty.yaml && \
-    crank beta validate /tmp/dummy /tmp/dummy \
-      --prefetch-all-crds \
-      --parallel-fetch 20 \
-      --crd-sources "github:crossplane/crossplane:main:cluster/crds" \
-      --crd-sources "github:crossplane-contrib/provider-upjet-aws:main:package/crds" \
-      --crd-sources "github:crossplane-contrib/provider-upjet-azure:main:package/crds" \
-      --crd-sources "github:crossplane-contrib/provider-helm:main:package/crds" \
-      --crd-sources "github:crossplane-contrib/provider-kubernetes:main:package/crds" \
-      --crd-sources "github:upbound/provider-vault:main:package/crds" \
-      --crd-sources "github:deinstapel/nats-jwt-operator:main:config/crd/bases" \
-      --crd-sources "github:crossplane-contrib/function-patch-and-transform:main:package/input" \
-      --crd-sources "github:crossplane-contrib/function-sequencer:main:package/input" \
-      --crd-sources "github:crossplane-contrib/function-tag-manager:main:package/input" \
-      --crd-sources "k8s:v1.34.0" \
-      --skip-success-results 2>&1 || true && \
-    echo "" && \
-    echo "=== CRD Cache Summary ===" && \
-    find /home/nonroot/.crossplane/cache/crd-sources/ -name "*.yaml" | wc -l | xargs -I{} echo "Total CRDs cached: {}" && \
-    ls -la /home/nonroot/.crossplane/cache/crd-sources/ && \
-    rm -rf /tmp/dummy
+# NOTE: CRD pre-caching is disabled because QEMU emulation on ARM Macs crashes
+# the Go runtime during cross-compilation builds. CRDs will be fetched at runtime.
+# To enable pre-caching, build on a native amd64 machine or use GitHub Actions.
+# 
+# The prefetch feature (--prefetch-all-crds) works correctly on native architectures.
+# See: https://github.com/golang/go/issues/58655 (QEMU lfstack.push bug)
 
 # Set working directory for validation
 WORKDIR /workspace
